@@ -1,14 +1,189 @@
 package scanner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
+	"golang.org/x/sync/errgroup"
 )
+
+func (s *Scanner) processBlocks(ctx context.Context) {
+	const (
+		// small delay for blocks with big batch of transactions
+		delayBase = 10 * time.Millisecond
+		delayMax  = 8 * time.Second
+	)
+	delay := delayBase
+
+	for {
+		master, err := s.api.LookupBlock(
+			ctx,
+			s.lastBlock.Workchain,
+			s.lastBlock.Shard,
+			s.lastBlock.SeqNo,
+		)
+		if err == nil {
+			delay = delayBase
+		}
+		if err != nil {
+			if !errors.Is(err, ton.ErrBlockNotFound) {
+				logrus.Errorf("[SCN] failed to lookup master block %d: %s", s.lastBlock.SeqNo, err)
+			}
+
+			// exponential retry
+			time.Sleep(delay)
+			delay *= 2
+			if delay > delayMax {
+				delay = delayMax
+			}
+
+			continue
+		}
+
+		scanErr := s.processMcBlock(ctx, master)
+		if scanErr != nil {
+			logrus.Error("[SCN] failed to process MC block: ", scanErr)
+		}
+	}
+}
+
+func (s *Scanner) processMcBlock(ctx context.Context, master *ton.BlockIDExt) error {
+	start := time.Now()
+
+	currentShards, err := s.api.GetBlockShardsInfo(ctx, master)
+	if err != nil {
+		return err
+	}
+
+	shards := make(map[string]*ton.BlockIDExt, len(currentShards))
+
+	for _, shard := range currentShards {
+		// unique key
+		key := fmt.Sprintf("%d:%d:%d", shard.Workchain, shard.Shard, shard.SeqNo)
+		shards[key] = shard
+
+		if err := s.fillWithNotSeenShards(ctx, shards, shard); err != nil {
+			return err
+		}
+		s.lastShardsSeqNo[s.getShardID(shard)] = shard.SeqNo
+	}
+
+	var (
+		eg  errgroup.Group
+		txs []*tlb.Transaction
+	)
+	for _, shard := range shards {
+		shardTxs, err := s.getTxsFromShard(ctx, shard)
+		if err != nil {
+			return err
+		}
+		txs = append(txs, shardTxs...)
+	}
+
+	for _, tx := range txs {
+		// goroutines for big batch of transactions
+		eg.Go(func() error {
+			if err := s.processTx(tx); err != nil {
+				// add block, otherwise scanner stucks here trying to get the same block
+				s.addBlock(master)
+				return err
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	s.addBlock(master)
+
+	lastSeqno, err := s.getLastBlockSeqno(ctx)
+	if err != nil {
+		logrus.Infof("[SCN] block [%d] processed in [%.2fs] with [%d] transactions",
+			master.SeqNo,
+			time.Since(start).Seconds(),
+			len(txs),
+		)
+	} else {
+		logrus.Infof("[SCN] block [%d|%d] processed in [%.2fs] with [%d] transactions",
+			master.SeqNo,
+			lastSeqno,
+			time.Since(start).Seconds(),
+			len(txs),
+		)
+	}
+
+	return nil
+}
+func (s *Scanner) getTxsFromShard(ctx context.Context, shard *ton.BlockIDExt) ([]*tlb.Transaction, error) {
+	var (
+		after    *ton.TransactionID3
+		more     = true
+		err      error
+		eg       errgroup.Group
+		txsShort []ton.TransactionShortInfo
+		mu       sync.Mutex
+		txs      []*tlb.Transaction
+	)
+
+	for more {
+		// problem: method can return duplicate transactions
+		txsShort, more, err = s.api.GetBlockTransactionsV2(
+			ctx,
+			shard,
+			100,
+			after,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if more {
+			after = txsShort[len(txsShort)-1].ID3()
+		}
+
+		// process only unique transactions
+		txsShortUnique := make(map[uint64]ton.TransactionShortInfo)
+		for _, tx := range txsShort {
+			txsShortUnique[tx.LT] = tx
+		}
+		for _, txShort := range txsShortUnique {
+			eg.Go(func() error {
+				tx, err := s.api.GetTransaction(
+					ctx,
+					shard,
+					address.NewAddress(0, 0, txShort.Account),
+					txShort.LT,
+				)
+				if err != nil {
+					logrus.Errorf("[SCN] failed to load tx: %s", err)
+					return err
+				}
+
+				mu.Lock()
+				txs = append(txs, tx)
+				mu.Unlock()
+
+				return nil
+			})
+		}
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, fmt.Errorf("[SCN] failed to get transactions: %w", err)
+	}
+
+	return txs, nil
+}
 
 func (s *Scanner) processTx(tx *tlb.Transaction) error {
 	if tx.IO.In.MsgType != tlb.MsgTypeInternal {
