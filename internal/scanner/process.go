@@ -151,12 +151,7 @@ func (s *Scanner) getTxsFromShard(ctx context.Context, shard *ton.BlockIDExt) ([
 			after = txsShort[len(txsShort)-1].ID3()
 		}
 
-		// process only unique transactions
-		txsShortUnique := make(map[uint64]ton.TransactionShortInfo)
-		for _, tx := range txsShort {
-			txsShortUnique[tx.LT] = tx
-		}
-		for _, txShort := range txsShortUnique {
+		for _, txShort := range txsShort {
 			eg.Go(func() error {
 				tx, err := s.api.GetTransaction(
 					ctx,
@@ -212,7 +207,7 @@ func (s *Scanner) processTx(tx *tlb.Transaction) error {
 	case 0:
 		comment, err := bodySlice.LoadStringSnake()
 		if err != nil {
-			return fmt.Errorf("failed to parse comment: %w", err)
+			return fmt.Errorf("[TON] failed to parse comment: %w", err)
 		}
 		logrus.Infof("%s TON received from %s with comment %q", amount, internalMsg.SenderAddr(), comment)
 	// jetton transfer notification
@@ -241,7 +236,7 @@ func (s *Scanner) processTx(tx *tlb.Transaction) error {
 			return nil
 		}
 		if fwdPayload == nil {
-			logrus.Infof("[JTN] %s jettons received from %s", amountFmt, sender)
+			logrus.Infof("%s jettons received from %s", amountFmt, sender)
 			return nil
 		}
 
@@ -258,7 +253,7 @@ func (s *Scanner) processTx(tx *tlb.Transaction) error {
 			return fmt.Errorf("[JTN] failed to parse forward payload comment: %s", err)
 		}
 
-		logrus.Infof("[JTN] %s jettons received from %s with comment %q", amountFmt, sender, comment)
+		logrus.Infof("%s jettons received from %s with comment %q", amountFmt, sender, comment)
 	}
 
 	return nil
