@@ -16,6 +16,7 @@ type Scanner struct {
 	api             *ton.APIClient
 	lastBlock       storage.Block
 	lastShardsSeqNo map[string]uint32
+	Client          *liteclient.ConnectionPool
 }
 
 func NewScanner(ctx context.Context) (*Scanner, error) {
@@ -31,7 +32,12 @@ func NewScanner(ctx context.Context) (*Scanner, error) {
 		api:             api,
 		lastBlock:       storage.Block{},
 		lastShardsSeqNo: make(map[string]uint32),
+		Client:          client,
 	}, nil
+}
+
+func (s *Scanner) Stop() {
+	s.Client.Stop()
 }
 
 func (s *Scanner) Listen(ctx context.Context) {

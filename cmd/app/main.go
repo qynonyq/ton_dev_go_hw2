@@ -3,6 +3,12 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/qynonyq/ton_dev_go_hw2/internal/app"
 	"github.com/qynonyq/ton_dev_go_hw2/internal/scanner"
@@ -18,13 +24,34 @@ func run() error {
 	if _, err := app.InitApp(); err != nil {
 		return err
 	}
-	ctx := context.Background()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sc, err := scanner.NewScanner(ctx)
 	if err != nil {
 		return err
 	}
-	sc.Listen(ctx)
+	go sc.Listen(ctx)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logrus.Infof("received %q, shutting down gracefully", sig)
+
+	stopped := make(chan struct{})
+	go func() {
+		sc.Stop()
+		cancel()
+		stopped <- struct{}{}
+	}()
+
+	select {
+	case <-time.After(5 * time.Second):
+		logrus.Info("shutdown timeout expired, scanner stopped")
+	case <-stopped:
+		logrus.Info("scanner gracefully stopped")
+	}
 
 	return nil
 }
